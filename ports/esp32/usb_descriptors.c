@@ -1,6 +1,6 @@
 /*
- * USB descriptors for ESP32-P4 (M5Stack Tab5) composite CDC + MIDI device.
- * Only compiled and active when CONFIG_USB_MIDI_BOARD_M5STACK_TAB5 is set.
+ * USB descriptors for the composite CDC + MIDI device (ESP32-P4 / ESP32-S3).
+ * Only compiled and active when CONFIG_USB_MIDI_USB_MODE_MIDI_DEVICE is set.
  *
  * NOTE: esp_tinyusb (>= 1.x new API) defines tud_descriptor_*_cb() itself
  * in descriptors_control.c. Do NOT define those callbacks here — they would
@@ -11,7 +11,7 @@
 
 #include "sdkconfig.h"  /* MUST come before the CONFIG_* check below */
 
-#ifdef CONFIG_USB_MIDI_BOARD_M5STACK_TAB5
+#ifdef CONFIG_USB_MIDI_USB_MODE_MIDI_DEVICE
 
 #include "tusb.h"
 
@@ -102,4 +102,4 @@ const char *midori_usb_string_descriptors[] = {
 const int midori_usb_string_descriptor_count =
     sizeof(midori_usb_string_descriptors) / sizeof(midori_usb_string_descriptors[0]);
 
-#endif /* CONFIG_USB_MIDI_BOARD_M5STACK_TAB5 */
+#endif /* CONFIG_USB_MIDI_USB_MODE_MIDI_DEVICE */

@@ -1,8 +1,11 @@
 /*
- * PicoRuby USB-MIDI Device - ESP32-P4 port (M5Stack Tab5)
+ * PicoRuby USB-MIDI Device - ESP32 port (ESP32-P4 / ESP32-S3)
  *
  * Uses TinyUSB (via esp_tinyusb managed component) to expose a composite
- * CDC + MIDI device on the USB-C FS OTG port (USB1).
+ * CDC + MIDI device on the full-speed OTG port:
+ *   ESP32-P4 (M5Stack Tab5): USB-C (USB1), USB-A stays a USB host
+ *   ESP32-S3 (CoreS3 / Freenove): the single USB-C connector; the USB-MIDI
+ *     host role is unavailable in this mode (one PHY, one controller)
  *
  * Thread model:
  *   TX: Ruby task (Core 1) → tud_midi_packet_write() (TinyUSB FIFO is mutex-protected)
@@ -13,7 +16,7 @@
 #include "sdkconfig.h"  /* MUST come before the CONFIG_* check below */
 #include "../../include/usb_midi_device.h"
 
-#ifdef CONFIG_USB_MIDI_BOARD_M5STACK_TAB5
+#ifdef CONFIG_USB_MIDI_USB_MODE_MIDI_DEVICE
 
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -21,7 +24,9 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#if CONFIG_IDF_TARGET_ESP32P4
 #include "hal/usb_serial_jtag_ll.h"
+#endif
 #include "esp_cpu.h"
 #include "esp_ipc.h"
 #include "tinyusb.h"
@@ -115,6 +120,7 @@ int USB_MIDI_DEVICE_start(void)
     int ret = USB_MIDI_DEVICE_init();
     if (ret != 0) return ret;
 
+#if CONFIG_IDF_TARGET_ESP32P4
     /*
      * ESP32-P4 has two internal FSLS PHYs behind a mux (LP_SYS.usb_ctrl):
      *   default: USJ → PHY 0, USB OTG1.1 → PHY 1
@@ -130,10 +136,22 @@ int USB_MIDI_DEVICE_start(void)
      * NOTE: After this point USB-Serial-JTAG is disconnected from USB-C.
      */
     usb_serial_jtag_ll_phy_select(1);
+#else
+    /*
+     * ESP32-S3 has a single internal FSLS PHY shared by USB-Serial/JTAG and
+     * USB-OTG; ESP-IDF's usb_phy driver (called by tinyusb_driver_install
+     * with phy.skip_setup = false) hands it to USB-OTG for us, so there is
+     * no mux to program here.
+     *
+     * NOTE: as on P4, USB-Serial/JTAG is disconnected from the connector
+     * afterwards — flashing needs manual download mode (BOOT + RESET).
+     */
+#endif
 
     /*
-     * Install TinyUSB on USB1 (TINYUSB_PORT_FULL_SPEED_0 = FS OTG = USB-C).
-     * USB0 (HS OTG = USB-A) is used by the USB host driver for MIDI keyboards.
+     * Install TinyUSB on the full-speed OTG port (TINYUSB_PORT_FULL_SPEED_0):
+     * on P4 that is USB1 = USB-C, leaving USB0 (HS OTG = USB-A) to the USB
+     * host driver for MIDI keyboards; on S3 it is the only OTG port.
      *
      * task config is mandatory: tinyusb_task_check_config() rejects
      * size==0 / priority==0, so a partially zeroed struct fails install.
@@ -316,10 +334,10 @@ void tud_midi_rx_cb(uint8_t itf)
     }
 }
 
-#else /* !CONFIG_USB_MIDI_BOARD_M5STACK_TAB5 */
+#else /* !CONFIG_USB_MIDI_USB_MODE_MIDI_DEVICE */
 
 /*--------------------------------------------------------------------+
- * Stub implementations for non-Tab5 boards
+ * Stub implementations for builds where the USB port is not a MIDI device
  *--------------------------------------------------------------------*/
 
 int  USB_MIDI_DEVICE_init(void)                                          { return -1; }
@@ -331,4 +349,4 @@ int  USB_MIDI_DEVICE_bytes_available(void)                               { retur
 int  USB_MIDI_DEVICE_read_packet(uint8_t *b, size_t l)                   { return 0; }
 void USB_MIDI_DEVICE_push_rx_packet(const uint8_t *p)                   {}
 
-#endif /* CONFIG_USB_MIDI_BOARD_M5STACK_TAB5 */
+#endif /* CONFIG_USB_MIDI_USB_MODE_MIDI_DEVICE */
