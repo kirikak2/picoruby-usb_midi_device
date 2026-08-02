@@ -1,7 +1,10 @@
 /*
  * PicoRuby USB-MIDI Device Driver
  *
- * USB MIDI device transport layer for PicoRuby (ESP32-P4 / M5Stack Tab5)
+ * USB MIDI device transport layer for PicoRuby (ESP32-P4 / ESP32-S3).
+ *
+ * Build-time configuration (USB identity, optional CDC interface, task
+ * placement) lives in usb_midi_device_config.h.
  */
 
 #ifndef USB_MIDI_DEVICE_DEFINED_H_
@@ -51,10 +54,35 @@ typedef struct {
 int USB_MIDI_DEVICE_init(void);
 
 /*
- * Install TinyUSB driver and start CDC + MIDI composite device.
- * Only functional on Tab5 (ESP32-P4). Returns -1 on other boards.
+ * Install the TinyUSB driver and start the USB-MIDI device (plus a CDC
+ * interface when built with USB_MIDI_DEVICE_WITH_CDC=1).
+ * Returns 0 on success, -1 when the port is disabled or install failed.
  */
 int USB_MIDI_DEVICE_start(void);
+
+/*
+ * CDC-ACM receive hook (only when built with USB_MIDI_DEVICE_WITH_CDC=1).
+ *
+ * The callback is invoked from the TinyUSB task with the bytes just read
+ * from the CDC interface; it may be called several times per USB transfer
+ * (at most USB_MIDI_DEVICE_CDC_RX_CHUNK bytes each). `data` is only valid
+ * for the duration of the call, so copy anything you need to keep.
+ *
+ * Keep the callback short and non-blocking: it runs on the same task that
+ * services USB, so stalling it stalls MIDI traffic as well.
+ *
+ * The callback is deliberately NOT defined by this gem — the host
+ * application supplies it (console command parser, protocol handler, ...).
+ * Registration works before or after USB_MIDI_DEVICE_start(); pass NULL to
+ * unregister.
+ *
+ * Returns 0 on success, -1 when this build has no CDC interface.
+ */
+typedef void (*usb_midi_device_cdc_rx_cb_t)(const uint8_t *data, size_t len,
+                                            void *arg);
+
+int USB_MIDI_DEVICE_set_cdc_rx_callback(usb_midi_device_cdc_rx_cb_t callback,
+                                        void *arg);
 
 /*
  * Returns true when the USB host has enumerated this device (ready state).

@@ -1,22 +1,24 @@
 /*
  * PicoRuby USB-MIDI Device - ESP32 port (ESP32-P4 / ESP32-S3)
  *
- * Uses TinyUSB (via esp_tinyusb managed component) to expose a composite
- * CDC + MIDI device on the full-speed OTG port:
- *   ESP32-P4 (M5Stack Tab5): USB-C (USB1), USB-A stays a USB host
- *   ESP32-S3 (CoreS3 / Freenove): the single USB-C connector; the USB-MIDI
- *     host role is unavailable in this mode (one PHY, one controller)
+ * Uses TinyUSB (via esp_tinyusb managed component) to expose a USB-MIDI
+ * device — optionally composite with CDC-ACM, see USB_MIDI_DEVICE_WITH_CDC
+ * — on the full-speed OTG port:
+ *   ESP32-P4 (e.g. M5Stack Tab5): USB-C (USB1), USB-A stays a USB host
+ *   ESP32-S3: the single USB-C connector; the USB-MIDI host role is
+ *     unavailable in this mode (one PHY, one controller)
  *
  * Thread model:
- *   TX: Ruby task (Core 1) → tud_midi_packet_write() (TinyUSB FIFO is mutex-protected)
- *   RX: TinyUSB task       → tud_midi_rx_cb() → SPSC ring buffer
- *       Ruby task (Core 1) → USB_MIDI_DEVICE_read_packet() ← ring buffer
+ *   TX: any task/timer → queue → TX task (same core as tud_task)
+ *                              → tud_midi_packet_write()
+ *   RX: TinyUSB task   → tud_midi_rx_cb() → SPSC ring buffer
+ *       Ruby task      → USB_MIDI_DEVICE_read_packet() ← ring buffer
  */
 
-#include "sdkconfig.h"  /* MUST come before the CONFIG_* check below */
+#include "../../include/usb_midi_device_config.h"
 #include "../../include/usb_midi_device.h"
 
-#ifdef CONFIG_USB_MIDI_USB_MODE_MIDI_DEVICE
+#if USB_MIDI_DEVICE_ENABLED
 
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -24,23 +26,22 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#if CONFIG_IDF_TARGET_ESP32P4
+#if CONFIG_IDF_TARGET_ESP32P4 && USB_MIDI_DEVICE_P4_PHY_SWAP
 #include "hal/usb_serial_jtag_ll.h"
 #endif
 #include "esp_cpu.h"
 #include "esp_ipc.h"
 #include "tinyusb.h"
+#if USB_MIDI_DEVICE_WITH_CDC
 #include "tinyusb_cdc_acm.h"
+#if USB_MIDI_DEVICE_CDC_CONSOLE
 #include "tinyusb_console.h"
+#endif
+#endif
 #include "tusb.h"
+#include "usb_descriptors.h"
 
 static const char *TAG = "USB_MIDI_DEV";
-
-/* Descriptor tables exported by usb_descriptors.c */
-extern const tusb_desc_device_t midori_usb_device_descriptor;
-extern const uint8_t midori_usb_fs_config_descriptor[];
-extern const char *midori_usb_string_descriptors[];
-extern const int midori_usb_string_descriptor_count;
 
 #define RX_BUFFER_MASK (USB_MIDI_DEVICE_RX_BUFFER_SIZE - 1)
 
@@ -69,7 +70,6 @@ static usb_midi_device_rx_buffer_t g_rx_buffer;
  */
 static QueueHandle_t g_tx_queue = NULL;
 static TaskHandle_t  g_tx_task  = NULL;
-#define USB_MIDI_TX_QUEUE_DEPTH 64
 
 /* Core-1 TX task: the sole caller of tud_midi_packet_write(). */
 static void usb_midi_tx_task(void *arg)
@@ -86,13 +86,57 @@ static void usb_midi_tx_task(void *arg)
 }
 
 /*--------------------------------------------------------------------+
+ * CDC-ACM receive hook (optional interface)
+ *
+ * The gem owns the esp_tinyusb registration; the actual handler is
+ * supplied by the application through USB_MIDI_DEVICE_set_cdc_rx_callback().
+ *--------------------------------------------------------------------*/
+
+#if USB_MIDI_DEVICE_WITH_CDC
+static usb_midi_device_cdc_rx_cb_t g_cdc_rx_cb  = NULL;
+static void                       *g_cdc_rx_arg = NULL;
+
+/* Runs in TinyUSB task context. Drains the CDC FIFO into the callback. */
+static void usb_midi_cdc_rx_callback(int itf, cdcacm_event_t *event)
+{
+    (void)event;
+    uint8_t buf[USB_MIDI_DEVICE_CDC_RX_CHUNK];
+
+    for (;;) {
+        size_t rx = 0;
+        esp_err_t err = tinyusb_cdcacm_read((tinyusb_cdcacm_itf_t)itf,
+                                            buf, sizeof(buf), &rx);
+        if (err != ESP_OK || rx == 0) break;
+
+        usb_midi_device_cdc_rx_cb_t cb = g_cdc_rx_cb;
+        if (cb) cb(buf, rx, g_cdc_rx_arg);
+    }
+}
+#endif
+
+int USB_MIDI_DEVICE_set_cdc_rx_callback(usb_midi_device_cdc_rx_cb_t callback,
+                                        void *arg)
+{
+#if USB_MIDI_DEVICE_WITH_CDC
+    g_cdc_rx_arg = arg;
+    g_cdc_rx_cb  = callback;   /* set the arg first: the TinyUSB task may
+                                * call the callback as soon as it is stored */
+    return 0;
+#else
+    (void)callback; (void)arg;
+    ESP_LOGW(TAG, "CDC RX callback ignored: built without USB_MIDI_DEVICE_WITH_CDC");
+    return -1;
+#endif
+}
+
+/*--------------------------------------------------------------------+
  * Init / Start
  *--------------------------------------------------------------------*/
 
 int USB_MIDI_DEVICE_init(void)
 {
     if (g_tx_queue == NULL) {
-        g_tx_queue = xQueueCreate(USB_MIDI_TX_QUEUE_DEPTH, 4 /* bytes/packet */);
+        g_tx_queue = xQueueCreate(USB_MIDI_DEVICE_TX_QUEUE_DEPTH, 4 /* bytes/packet */);
         if (g_tx_queue == NULL) {
             ESP_LOGE(TAG, "Failed to create TX queue");
             return -1;
@@ -120,13 +164,14 @@ int USB_MIDI_DEVICE_start(void)
     int ret = USB_MIDI_DEVICE_init();
     if (ret != 0) return ret;
 
-#if CONFIG_IDF_TARGET_ESP32P4
+#if CONFIG_IDF_TARGET_ESP32P4 && USB_MIDI_DEVICE_P4_PHY_SWAP
     /*
      * ESP32-P4 has two internal FSLS PHYs behind a mux (LP_SYS.usb_ctrl):
      *   default: USJ → PHY 0, USB OTG1.1 → PHY 1
-     * Tab5's USB-C connector is wired to PHY 0's pads (that is why USJ
-     * flashing/monitor works there). Swap the mux so OTG1.1 gets PHY 0
-     * and USJ is parked on the unrouted PHY 1.
+     * On boards like the Tab5 the USB-C connector is wired to PHY 0's pads
+     * (that is why USJ flashing/monitor works there). Swap the mux so
+     * OTG1.1 gets PHY 0 and USJ is parked on the unrouted PHY 1.
+     * Set USB_MIDI_DEVICE_P4_PHY_SWAP=0 on a board wired the other way.
      *
      * Neither ESP-IDF's usb_phy driver nor esp_tinyusb performs this
      * routing, so we must do it ourselves. We use the USJ LL helper
@@ -155,7 +200,6 @@ int USB_MIDI_DEVICE_start(void)
      *
      * task config is mandatory: tinyusb_task_check_config() rejects
      * size==0 / priority==0, so a partially zeroed struct fails install.
-     * TinyUSB device task goes to Core 0 (Ruby runs on Core 1).
      *
      * Descriptors MUST be passed through the config struct: esp_tinyusb
      * defines tud_descriptor_*_cb() itself, so callback-style descriptors
@@ -169,25 +213,24 @@ int USB_MIDI_DEVICE_start(void)
             .vbus_monitor_io = -1,
         },
         .task = {
-            .size = 4096,
-            .priority = 5,
-            /* Pin to Core 1 — the SAME core as the PicoRuby VM task
-             * (picoruby_supervisor.c pins it to core 1). MIDI TX is driven
-             * from the VM task via tud_midi_packet_write(), which reaches
-             * into the shared usbd layer (usbd_edpt_claim/xfer). If the
-             * TinyUSB device task runs on a different core, those calls
-             * execute in TRUE parallel with tud_task and corrupt usbd/FIFO
-             * state (observed: flaky VM-heap corruption crashing mruby/c).
-             * Same-core placement lets FreeRTOS preemption + the atomic
-             * endpoint claim serialize them safely. */
-            .xCoreID = 1,
+            .size = USB_MIDI_DEVICE_TUSB_TASK_STACK_SIZE,
+            .priority = USB_MIDI_DEVICE_TUSB_TASK_PRIORITY,
+            /* Pin to the same core as the TX task below (and, in a PicoRuby
+             * build, as the VM task). MIDI TX reaches into the shared usbd
+             * layer (usbd_edpt_claim/xfer); if the TinyUSB device task runs
+             * on a different core those calls execute in TRUE parallel with
+             * tud_task and corrupt usbd/FIFO state (observed: flaky VM-heap
+             * corruption crashing mruby/c). Same-core placement lets
+             * FreeRTOS preemption + the atomic endpoint claim serialize them
+             * safely. */
+            .xCoreID = USB_MIDI_DEVICE_TASK_CORE,
         },
         .descriptor = {
-            .device = &midori_usb_device_descriptor,
+            .device = &usb_midi_device_desc_device,
             .qualifier = NULL,
-            .string = midori_usb_string_descriptors,
-            .string_count = 6,  /* lang, mfr, product, serial, CDC itf, MIDI itf */
-            .full_speed_config = midori_usb_fs_config_descriptor,
+            .string = usb_midi_device_string_desc,
+            .string_count = usb_midi_device_string_desc_count,
+            .full_speed_config = usb_midi_device_desc_fs_config,
             .high_speed_config = NULL,  /* FS port only */
         },
     };
@@ -198,10 +241,13 @@ int USB_MIDI_DEVICE_start(void)
         return -1;
     }
 
-    /* Initialize CDC ACM so the CDC interface acts as a serial console */
+#if USB_MIDI_DEVICE_WITH_CDC
+    /* Bring up CDC ACM. The RX callback is registered unconditionally so an
+     * application handler installed later (or earlier) is honoured; the gem
+     * itself only forwards the bytes. */
     const tinyusb_config_cdcacm_t acm_cfg = {
         .cdc_port                   = TINYUSB_CDC_ACM_0,
-        .callback_rx                = NULL,
+        .callback_rx                = usb_midi_cdc_rx_callback,
         .callback_rx_wanted_char    = NULL,
         .callback_line_state_changed = NULL,
         .callback_line_coding_changed = NULL,
@@ -209,29 +255,40 @@ int USB_MIDI_DEVICE_start(void)
 
     err = tinyusb_cdcacm_init(&acm_cfg);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "CDC ACM init failed (%s); console may not appear over USB",
-                 esp_err_to_name(err));
-    } else {
-        /* Redirect ESP_LOG to USB CDC so idf.py monitor works on the USB-C port */
+        ESP_LOGW(TAG, "CDC ACM init failed: %s", esp_err_to_name(err));
+    }
+#if USB_MIDI_DEVICE_CDC_CONSOLE
+    else {
+        /* Redirect stdout / ESP_LOG to USB CDC so a serial monitor works on
+         * the same connector */
         err = tinyusb_console_init(0);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "tinyusb_console_init failed: %s", esp_err_to_name(err));
         }
     }
+#endif
+#endif /* USB_MIDI_DEVICE_WITH_CDC */
 
-    /* Start the Core-1 TX task now that TinyUSB is up. It is the only caller
-     * of tud_midi_packet_write(), keeping all sends on the same core as
-     * tud_task. Priority 4: above the VM task (3), below tud_task (5). */
+    /* Start the TX task now that TinyUSB is up. It is the only caller of
+     * tud_midi_packet_write(), keeping all sends on the same core as
+     * tud_task, and runs just below tud_task in priority. */
     if (g_tx_task == NULL) {
         BaseType_t tret = xTaskCreatePinnedToCore(
-            usb_midi_tx_task, "usbmidi_tx", 3072, NULL, 4, &g_tx_task, 1);
+            usb_midi_tx_task, "usbmidi_tx",
+            USB_MIDI_DEVICE_TX_TASK_STACK_SIZE, NULL,
+            USB_MIDI_DEVICE_TX_TASK_PRIORITY, &g_tx_task,
+            USB_MIDI_DEVICE_TASK_CORE);
         if (tret != pdPASS) {
             ESP_LOGE(TAG, "Failed to create USB MIDI TX task");
             return -1;
         }
     }
 
-    ESP_LOGI(TAG, "USB MIDI Device started (CDC + MIDI composite on USB-C FS OTG)");
+#if USB_MIDI_DEVICE_WITH_CDC
+    ESP_LOGI(TAG, "USB MIDI Device started (MIDI + CDC composite, FS OTG)");
+#else
+    ESP_LOGI(TAG, "USB MIDI Device started (MIDI only, FS OTG)");
+#endif
     return 0;
 }
 
@@ -334,7 +391,7 @@ void tud_midi_rx_cb(uint8_t itf)
     }
 }
 
-#else /* !CONFIG_USB_MIDI_USB_MODE_MIDI_DEVICE */
+#else /* !USB_MIDI_DEVICE_ENABLED */
 
 /*--------------------------------------------------------------------+
  * Stub implementations for builds where the USB port is not a MIDI device
@@ -348,5 +405,7 @@ int  USB_MIDI_DEVICE_send_packet(uint8_t c, uint8_t ci,
 int  USB_MIDI_DEVICE_bytes_available(void)                               { return 0; }
 int  USB_MIDI_DEVICE_read_packet(uint8_t *b, size_t l)                   { return 0; }
 void USB_MIDI_DEVICE_push_rx_packet(const uint8_t *p)                   {}
+int  USB_MIDI_DEVICE_set_cdc_rx_callback(usb_midi_device_cdc_rx_cb_t cb,
+                                          void *arg)                     { return -1; }
 
-#endif /* CONFIG_USB_MIDI_USB_MODE_MIDI_DEVICE */
+#endif /* USB_MIDI_DEVICE_ENABLED */
