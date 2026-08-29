@@ -69,6 +69,24 @@
 #  define USB_MIDI_DEVICE_CDC_CONSOLE USB_MIDI_DEVICE_WITH_CDC
 #endif
 
+/*
+ * Attach to the chip's high-speed (USB 2.0 OTG) port instead of the
+ * full-speed (OTG 1.1) one. Only meaningful on chips that have both -- the
+ * ESP32-P4 does; the ESP32-S3 has a single full-speed port and ignores this.
+ *
+ * Which one to pick is a board wiring fact: the device connector is soldered
+ * to one port's pads and nothing else reaches it. Getting it wrong is silent
+ * -- TinyUSB installs happily and drives pins that go nowhere, so the host
+ * never sees a device at all.
+ */
+#ifndef USB_MIDI_DEVICE_HIGH_SPEED
+#  ifdef CONFIG_USB_MIDI_DEVICE_HIGH_SPEED
+#    define USB_MIDI_DEVICE_HIGH_SPEED 1
+#  else
+#    define USB_MIDI_DEVICE_HIGH_SPEED 0
+#  endif
+#endif
+
 /* Bytes handed to the CDC RX callback per invocation */
 #ifndef USB_MIDI_DEVICE_CDC_RX_CHUNK
 #  define USB_MIDI_DEVICE_CDC_RX_CHUNK 64
@@ -192,9 +210,17 @@
  * USB-Serial/JTAG owns by default. Correct for boards whose device-role
  * connector is wired to PHY 0 (e.g. M5Stack Tab5). Set to 0 on a board
  * that routes OTG1.1 to its own pads.
+ *
+ * The mux only feeds the two full-speed PHYs, so it is meaningless on the
+ * high-speed port (which has its own UTMI PHY) and defaults off there --
+ * performing it anyway would disconnect USB-Serial/JTAG for nothing.
  */
 #ifndef USB_MIDI_DEVICE_P4_PHY_SWAP
-#  define USB_MIDI_DEVICE_P4_PHY_SWAP 1
+#  if USB_MIDI_DEVICE_HIGH_SPEED
+#    define USB_MIDI_DEVICE_P4_PHY_SWAP 0
+#  else
+#    define USB_MIDI_DEVICE_P4_PHY_SWAP 1
+#  endif
 #endif
 
 #endif /* PICORUBY_USB_MIDI_DEVICE_CONFIG_H_ */

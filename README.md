@@ -197,14 +197,28 @@ void app_main(void)
   USB-Serial/JTAG, so a USB-MIDI *host* cannot coexist with this gem in
   the same build. ESP-IDF's `usb_phy` driver performs the hand-over
   (`phy.skip_setup = false`); nothing extra to configure.
-- **ESP32-P4** — `USB_MIDI_DEVICE_start()` swaps the FSLS PHY mux
-  (`usb_serial_jtag_ll_phy_select(1)`) so OTG1.1 drives the USB-C pads.
-  The HS OTG port (USB-A on the Tab5) is untouched and can still run a
-  USB host driver.
-- On both targets USB-Serial/JTAG is disconnected from the connector once
-  the driver starts: `idf.py flash` then needs manual download mode (hold
-  BOOT, tap RESET), while `idf.py monitor` works over the TinyUSB CDC
-  port.
+- **ESP32-P4** — two ports can take the device role, and a board wires
+  its connector to exactly one of them; nothing else reaches it. Pick with
+  `USB_MIDI_DEVICE_HIGH_SPEED`:
+  - `0` (default) — full-speed OTG1.1. `USB_MIDI_DEVICE_start()` also
+    swaps the FSLS PHY mux (`usb_serial_jtag_ll_phy_select(1)`) so OTG1.1
+    drives the pads USB-Serial/JTAG owns by default, which is how the
+    M5Stack Tab5 is wired. The HS OTG port (USB-A on the Tab5) is
+    untouched and can still run a USB host driver.
+  - `1` — high-speed OTG2.0, which has its own UTMI PHY and needs no mux
+    programming (`USB_MIDI_DEVICE_P4_PHY_SWAP` therefore defaults to 0).
+    Bulk endpoints become 512 bytes, as the USB spec requires at high
+    speed, and the gem supplies the high-speed configuration descriptor
+    and the device qualifier that a high-speed device must publish.
+
+  Choosing the wrong one fails silently: `tinyusb_driver_install()`
+  succeeds and logs `TinyUSB Driver installed on port N`, but the pins it
+  drives go nowhere and the host never sees a device.
+- Whenever the full-speed port is used, USB-Serial/JTAG loses the
+  connector once the driver starts: `idf.py flash` then needs manual
+  download mode (hold BOOT, tap RESET), while `idf.py monitor` works over
+  the TinyUSB CDC port. The P4's high-speed port leaves USB-Serial/JTAG
+  alone, so a board wired that way keeps whatever it flashes over.
 - The TX task is pinned to core 1, the same core as TinyUSB's device
   task, because `tud_midi_packet_write()` must never run in true parallel
   with `tud_task()`. If the PicoRuby VM task runs on a different core,
@@ -249,7 +263,8 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
 | `USB_MIDI_DEVICE_EPNUM_MIDI_IN` / `_OUT` | `0x81` / `0x01` (`0x83` / `0x03` with CDC) | MIDI endpoints |
 | `USB_MIDI_DEVICE_TASK_CORE` | 1 | Core for the TinyUSB and TX tasks |
 | `USB_MIDI_DEVICE_TUSB_TASK_*`, `_TX_TASK_*`, `_TX_QUEUE_DEPTH` | see header | Task stack / priority / queue depth |
-| `USB_MIDI_DEVICE_P4_PHY_SWAP` | 1 | ESP32-P4 only: swap the FSLS PHY mux to OTG1.1 |
+| `USB_MIDI_DEVICE_HIGH_SPEED` | 0 (1 if `CONFIG_USB_MIDI_DEVICE_HIGH_SPEED`) | Use the chip's high-speed port (ESP32-P4 OTG2.0) instead of the full-speed one |
+| `USB_MIDI_DEVICE_P4_PHY_SWAP` | 1, or 0 with `HIGH_SPEED` | ESP32-P4 only: swap the FSLS PHY mux to OTG1.1 |
 
 ### Optional CDC interface
 
