@@ -32,21 +32,25 @@
 /*--------------------------------------------------------------------+
  * Device Descriptor
  *--------------------------------------------------------------------*/
+#if USB_MIDI_DEVICE_WITH_CDC
+/* IAD is required for composite devices with CDC */
+#define USB_MIDI_DEVICE_DESC_CLASS     TUSB_CLASS_MISC
+#define USB_MIDI_DEVICE_DESC_SUBCLASS  MISC_SUBCLASS_COMMON
+#define USB_MIDI_DEVICE_DESC_PROTOCOL  MISC_PROTOCOL_IAD
+#else
+/* MIDI-only: class information lives in the interface descriptors */
+#define USB_MIDI_DEVICE_DESC_CLASS     TUSB_CLASS_UNSPECIFIED
+#define USB_MIDI_DEVICE_DESC_SUBCLASS  0x00
+#define USB_MIDI_DEVICE_DESC_PROTOCOL  0x00
+#endif
+
 const tusb_desc_device_t usb_midi_device_desc_device = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
     .bcdUSB             = USB_MIDI_DEVICE_BCD_USB,
-#if USB_MIDI_DEVICE_WITH_CDC
-    /* IAD is required for composite devices with CDC */
-    .bDeviceClass       = TUSB_CLASS_MISC,
-    .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
-    .bDeviceProtocol    = MISC_PROTOCOL_IAD,
-#else
-    /* MIDI-only: class information lives in the interface descriptors */
-    .bDeviceClass       = TUSB_CLASS_UNSPECIFIED,
-    .bDeviceSubClass    = 0x00,
-    .bDeviceProtocol    = 0x00,
-#endif
+    .bDeviceClass       = USB_MIDI_DEVICE_DESC_CLASS,
+    .bDeviceSubClass    = USB_MIDI_DEVICE_DESC_SUBCLASS,
+    .bDeviceProtocol    = USB_MIDI_DEVICE_DESC_PROTOCOL,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = USB_MIDI_DEVICE_VID,
     .idProduct          = USB_MIDI_DEVICE_PID,
@@ -88,24 +92,63 @@ enum {
 #define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_MIDI_DESC_LEN)
 #endif
 
-const uint8_t usb_midi_device_desc_fs_config[] =
-{
-    /* Configuration header: bus-powered, 100 mA */
-    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
+/*
+ * The two configurations differ only in bulk endpoint size, which the USB
+ * spec fixes per bus speed: 64 bytes at full speed, 512 at high speed. The
+ * interrupt notification endpoint is unaffected.
+ *
+ * A high-speed-capable device must publish both, because the host asks for
+ * the other speed's configuration (GET_DESCRIPTOR OTHER_SPEED_CONFIGURATION)
+ * to learn what it would get if it re-enumerated at the other speed.
+ */
+#define USB_MIDI_DEVICE_CONFIG_DESCRIPTOR(epsize)                       \
+    /* Configuration header: bus-powered, 100 mA */                     \
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100), \
+    CDC_DESCRIPTOR_OR_NOTHING(epsize)                                   \
+    /* MIDI Audio Control + Streaming interfaces */                     \
+    TUD_MIDI_DESCRIPTOR(ITF_NUM_MIDI, STRID_MIDI,                       \
+                        USB_MIDI_DEVICE_EPNUM_MIDI_OUT,                 \
+                        USB_MIDI_DEVICE_EPNUM_MIDI_IN, epsize)
 
 #if USB_MIDI_DEVICE_WITH_CDC
-    /* CDC: notif EP, data EP pair, 64-byte bulk */
-    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC,
-                       USB_MIDI_DEVICE_EPNUM_CDC_NOTIF, 8,
-                       USB_MIDI_DEVICE_EPNUM_CDC_OUT,
-                       USB_MIDI_DEVICE_EPNUM_CDC_IN, 64),
+#define CDC_DESCRIPTOR_OR_NOTHING(epsize)                               \
+    /* CDC: notif EP, then a bulk data EP pair */                       \
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC,                          \
+                       USB_MIDI_DEVICE_EPNUM_CDC_NOTIF, 8,              \
+                       USB_MIDI_DEVICE_EPNUM_CDC_OUT,                   \
+                       USB_MIDI_DEVICE_EPNUM_CDC_IN, epsize),
+#else
+#define CDC_DESCRIPTOR_OR_NOTHING(epsize)
 #endif
 
-    /* MIDI Audio Control + Streaming interfaces */
-    TUD_MIDI_DESCRIPTOR(ITF_NUM_MIDI, STRID_MIDI,
-                        USB_MIDI_DEVICE_EPNUM_MIDI_OUT,
-                        USB_MIDI_DEVICE_EPNUM_MIDI_IN, 64),
+const uint8_t usb_midi_device_desc_fs_config[] =
+{
+    USB_MIDI_DEVICE_CONFIG_DESCRIPTOR(64),
 };
+
+#if USB_MIDI_DEVICE_HIGH_SPEED
+const uint8_t usb_midi_device_desc_hs_config[] =
+{
+    USB_MIDI_DEVICE_CONFIG_DESCRIPTOR(512),
+};
+
+/*
+ * Device qualifier: what this device would look like at the other speed.
+ * Everything matches the device descriptor except that it carries no
+ * identity - it exists purely to say "I am also capable of the other speed".
+ */
+const tusb_desc_device_qualifier_t usb_midi_device_desc_qualifier = {
+    .bLength            = sizeof(tusb_desc_device_qualifier_t),
+    .bDescriptorType    = TUSB_DESC_DEVICE_QUALIFIER,
+    .bcdUSB             = USB_MIDI_DEVICE_BCD_USB,
+    .bDeviceClass       = USB_MIDI_DEVICE_DESC_CLASS,
+    .bDeviceSubClass    = USB_MIDI_DEVICE_DESC_SUBCLASS,
+    .bDeviceProtocol    = USB_MIDI_DEVICE_DESC_PROTOCOL,
+    .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
+    .bNumConfigurations = 0x01,
+    .bReserved          = 0x00,
+};
+#endif /* USB_MIDI_DEVICE_HIGH_SPEED */
 
 /*--------------------------------------------------------------------+
  * String Descriptors

@@ -194,9 +194,11 @@ int USB_MIDI_DEVICE_start(void)
 #endif
 
     /*
-     * Install TinyUSB on the full-speed OTG port (TINYUSB_PORT_FULL_SPEED_0):
-     * on P4 that is USB1 = USB-C, leaving USB0 (HS OTG = USB-A) to the USB
-     * host driver for MIDI keyboards; on S3 it is the only OTG port.
+     * Install TinyUSB on the port the board's device connector is wired to
+     * (USB_MIDI_DEVICE_HIGH_SPEED, see usb_midi_device_config.h). On the P4
+     * the full-speed port is OTG1.1 and the high-speed one is OTG2.0, and
+     * only one of them reaches any given connector; on the S3 there is a
+     * single full-speed port and the knob has no effect.
      *
      * task config is mandatory: tinyusb_task_check_config() rejects
      * size==0 / priority==0, so a partially zeroed struct fails install.
@@ -206,7 +208,11 @@ int USB_MIDI_DEVICE_start(void)
      * would be ignored and the default CDC-only descriptor used instead.
      */
     const tinyusb_config_t tusb_cfg = {
+#if USB_MIDI_DEVICE_HIGH_SPEED
+        .port = TINYUSB_PORT_HIGH_SPEED_0,
+#else
         .port = TINYUSB_PORT_FULL_SPEED_0,
+#endif
         .phy = {
             .skip_setup = false,
             .self_powered = false,
@@ -227,11 +233,18 @@ int USB_MIDI_DEVICE_start(void)
         },
         .descriptor = {
             .device = &usb_midi_device_desc_device,
-            .qualifier = NULL,
             .string = usb_midi_device_string_desc,
             .string_count = usb_midi_device_string_desc_count,
             .full_speed_config = usb_midi_device_desc_fs_config,
+#if USB_MIDI_DEVICE_HIGH_SPEED
+            /* Both are mandatory on the HS port: the host asks for the
+             * other speed's configuration and for the qualifier. */
+            .high_speed_config = usb_midi_device_desc_hs_config,
+            .qualifier = &usb_midi_device_desc_qualifier,
+#else
             .high_speed_config = NULL,  /* FS port only */
+            .qualifier = NULL,
+#endif
         },
     };
 
@@ -284,10 +297,17 @@ int USB_MIDI_DEVICE_start(void)
         }
     }
 
-#if USB_MIDI_DEVICE_WITH_CDC
-    ESP_LOGI(TAG, "USB MIDI Device started (MIDI + CDC composite, FS OTG)");
+#if USB_MIDI_DEVICE_HIGH_SPEED
+#  define USB_MIDI_DEVICE_PORT_NAME "HS OTG"
 #else
-    ESP_LOGI(TAG, "USB MIDI Device started (MIDI only, FS OTG)");
+#  define USB_MIDI_DEVICE_PORT_NAME "FS OTG"
+#endif
+#if USB_MIDI_DEVICE_WITH_CDC
+    ESP_LOGI(TAG, "USB MIDI Device started (MIDI + CDC composite, "
+                  USB_MIDI_DEVICE_PORT_NAME ")");
+#else
+    ESP_LOGI(TAG, "USB MIDI Device started (MIDI only, "
+                  USB_MIDI_DEVICE_PORT_NAME ")");
 #endif
     return 0;
 }
