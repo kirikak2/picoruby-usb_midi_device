@@ -114,6 +114,45 @@ int USB_MIDI_DEVICE_read_packet(uint8_t *out_buffer, size_t max_len);
  */
 void USB_MIDI_DEVICE_push_rx_packet(const uint8_t *packet);
 
+/*
+ * Diagnostics: a snapshot of the TinyUSB device state and of the traffic
+ * counters kept by this gem. Safe to call from any task; the values are
+ * read without locking, so a snapshot may be slightly inconsistent.
+ *
+ * Endpoint flags are bitmasks: bit 0 MIDI OUT, bit 1 MIDI IN, bit 2 CDC
+ * OUT, bit 3 CDC IN (the last two stay 0 without a CDC interface).
+ */
+typedef struct {
+    bool     mounted;
+    bool     suspended;
+    bool     cdc_connected;     /* DTR set by the host */
+    uint8_t  ep_busy;
+    uint8_t  ep_stalled;
+    uint32_t cdc_rx_avail;      /* bytes waiting in TinyUSB's CDC RX FIFO */
+    uint32_t cdc_tx_free;       /* free space in TinyUSB's CDC TX FIFO */
+    uint32_t midi_rx_avail;     /* bytes waiting in TinyUSB's MIDI RX FIFO */
+    uint32_t tx_queue_waiting;  /* packets queued for the TX task */
+
+    /* DCD events seen by the usbd queue (counted when queued, from ISR) */
+    uint32_t ev_total;
+    uint32_t ev_bus_reset;
+    uint32_t ev_suspend;
+    uint32_t ev_resume;
+    uint32_t ev_setup;
+    uint32_t ev_xfer;
+    uint32_t ev_last_ms;        /* uptime of the last event */
+
+    uint32_t midi_rx_pkts;      /* host -> device */
+    uint32_t midi_tx_ok;        /* device -> host, accepted by TinyUSB */
+    uint32_t midi_tx_fail;      /* tud_midi_packet_write() returned 0 */
+    uint32_t midi_tx_drop;      /* not ready / TX queue full */
+    uint32_t cdc_rx_bytes;
+    uint32_t cdc_rx_last_ms;
+    uint32_t tusb_task_ms;      /* last time the TinyUSB task ran a callback */
+} usb_midi_device_stats_t;
+
+void USB_MIDI_DEVICE_get_stats(usb_midi_device_stats_t *out);
+
 #ifdef __cplusplus
 }
 #endif

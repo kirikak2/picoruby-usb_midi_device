@@ -39,6 +39,9 @@
 #endif
 #endif
 #include "tusb.h"
+#include "device/dcd.h"
+#include "device/usbd_pvt.h"
+#include "esp_timer.h"
 #include "usb_descriptors.h"
 
 static const char *TAG = "USB_MIDI_DEV";
@@ -46,6 +49,19 @@ static const char *TAG = "USB_MIDI_DEV";
 #define RX_BUFFER_MASK (USB_MIDI_DEVICE_RX_BUFFER_SIZE - 1)
 
 static usb_midi_device_rx_buffer_t g_rx_buffer;
+
+/* Diagnostics (USB_MIDI_DEVICE_get_stats). Plain counters: written by one
+ * context each (ISR, TinyUSB task, TX task), read racily by the viewer. */
+static volatile uint32_t s_ev_total, s_ev_bus_reset, s_ev_suspend,
+                         s_ev_resume, s_ev_setup, s_ev_xfer, s_ev_last_ms;
+static volatile uint32_t s_midi_rx_pkts, s_midi_tx_ok, s_midi_tx_fail,
+                         s_midi_tx_drop;
+static volatile uint32_t s_cdc_rx_bytes, s_cdc_rx_last_ms, s_tusb_task_ms;
+
+static inline uint32_t uptime_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
 
 /*
  * MIDI TX must always run on the SAME core as the TinyUSB device task
@@ -78,8 +94,12 @@ static void usb_midi_tx_task(void *arg)
     uint8_t packet[4];
     for (;;) {
         if (xQueueReceive(g_tx_queue, packet, portMAX_DELAY) == pdTRUE) {
-            if (tud_ready()) {
-                tud_midi_packet_write(packet);
+            if (!tud_ready()) {
+                s_midi_tx_drop++;
+            } else if (tud_midi_packet_write(packet)) {
+                s_midi_tx_ok++;
+            } else {
+                s_midi_tx_fail++;
             }
         }
     }
@@ -101,12 +121,15 @@ static void usb_midi_cdc_rx_callback(int itf, cdcacm_event_t *event)
 {
     (void)event;
     uint8_t buf[USB_MIDI_DEVICE_CDC_RX_CHUNK];
+    s_tusb_task_ms = uptime_ms();
 
     for (;;) {
         size_t rx = 0;
         esp_err_t err = tinyusb_cdcacm_read((tinyusb_cdcacm_itf_t)itf,
                                             buf, sizeof(buf), &rx);
         if (err != ESP_OK || rx == 0) break;
+        s_cdc_rx_bytes += (uint32_t)rx;
+        s_cdc_rx_last_ms = uptime_ms();
 
         usb_midi_device_cdc_rx_cb_t cb = g_cdc_rx_cb;
         if (cb) cb(buf, rx, g_cdc_rx_arg);
@@ -329,6 +352,7 @@ int USB_MIDI_DEVICE_send_packet(uint8_t cable, uint8_t cin,
                                 uint8_t midi1, uint8_t midi2, uint8_t midi3)
 {
     if (!tud_ready() || g_tx_queue == NULL) {
+        s_midi_tx_drop++;
         return -1;
     }
 
@@ -344,6 +368,7 @@ int USB_MIDI_DEVICE_send_packet(uint8_t cable, uint8_t cin,
      * Short bounded wait so a momentary full queue applies backpressure
      * rather than dropping notes; give up (drop) if it stays full. */
     if (xQueueSend(g_tx_queue, packet, pdMS_TO_TICKS(5)) != pdTRUE) {
+        s_midi_tx_drop++;
         return -1;
     }
     return 0;
@@ -405,10 +430,84 @@ void tud_midi_rx_cb(uint8_t itf)
 {
     (void)itf;
     uint8_t packet[4];
+    s_tusb_task_ms = uptime_ms();
     /* Drain all available 4-byte USB-MIDI packets into our ring buffer */
     while (tud_midi_packet_read(packet)) {
         USB_MIDI_DEVICE_push_rx_packet(packet);
+        s_midi_rx_pkts++;
     }
+}
+
+/*--------------------------------------------------------------------+
+ * Diagnostics
+ *--------------------------------------------------------------------*/
+
+/* TinyUSB: every DCD event as it is queued for tud_task (mostly from the
+ * USB ISR). An event the queue cannot take is dropped before this hook,
+ * so a transfer that completes without bumping ev_xfer leaves its
+ * endpoint busy until the next bus reset. */
+void tud_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr)
+{
+    (void)rhport; (void)in_isr;
+    s_ev_total++;
+    s_ev_last_ms = uptime_ms();
+    switch (eventid) {
+    case DCD_EVENT_BUS_RESET:       s_ev_bus_reset++; break;
+    case DCD_EVENT_SUSPEND:         s_ev_suspend++;   break;
+    case DCD_EVENT_RESUME:          s_ev_resume++;    break;
+    case DCD_EVENT_SETUP_RECEIVED:  s_ev_setup++;     break;
+    case DCD_EVENT_XFER_COMPLETE:   s_ev_xfer++;      break;
+    default: break;
+    }
+}
+
+static uint8_t ep_flags(bool (*fn)(uint8_t, uint8_t))
+{
+    static const uint8_t eps[] = {
+        USB_MIDI_DEVICE_EPNUM_MIDI_OUT, USB_MIDI_DEVICE_EPNUM_MIDI_IN,
+#if USB_MIDI_DEVICE_WITH_CDC
+        USB_MIDI_DEVICE_EPNUM_CDC_OUT, USB_MIDI_DEVICE_EPNUM_CDC_IN,
+#endif
+    };
+    uint8_t bits = 0;
+    for (size_t i = 0; i < sizeof(eps); i++) {
+        if (fn(0, eps[i])) bits |= (uint8_t)(1u << i);
+    }
+    return bits;
+}
+
+void USB_MIDI_DEVICE_get_stats(usb_midi_device_stats_t *out)
+{
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+
+    out->mounted   = tud_mounted();
+    out->suspended = tud_suspended();
+    out->ep_busy    = ep_flags(usbd_edpt_busy);
+    out->ep_stalled = ep_flags(usbd_edpt_stalled);
+#if USB_MIDI_DEVICE_WITH_CDC
+    out->cdc_connected = tud_cdc_n_connected(0);
+    out->cdc_rx_avail  = tud_cdc_n_available(0);
+    out->cdc_tx_free   = tud_cdc_n_write_available(0);
+#endif
+    out->midi_rx_avail = tud_midi_available();
+    out->tx_queue_waiting = g_tx_queue ? (uint32_t)uxQueueMessagesWaiting(g_tx_queue) : 0;
+
+    out->ev_total     = s_ev_total;
+    out->ev_bus_reset = s_ev_bus_reset;
+    out->ev_suspend   = s_ev_suspend;
+    out->ev_resume    = s_ev_resume;
+    out->ev_setup     = s_ev_setup;
+    out->ev_xfer      = s_ev_xfer;
+    out->ev_last_ms   = s_ev_last_ms;
+
+    out->midi_rx_pkts = s_midi_rx_pkts;
+    out->midi_tx_ok   = s_midi_tx_ok;
+    out->midi_tx_fail = s_midi_tx_fail;
+    out->midi_tx_drop = s_midi_tx_drop;
+    out->cdc_rx_bytes = s_cdc_rx_bytes;
+    out->cdc_rx_last_ms = s_cdc_rx_last_ms;
+    out->tusb_task_ms = s_tusb_task_ms;
 }
 
 #else /* !USB_MIDI_DEVICE_ENABLED */
@@ -425,6 +524,10 @@ int  USB_MIDI_DEVICE_send_packet(uint8_t c, uint8_t ci,
 int  USB_MIDI_DEVICE_bytes_available(void)                               { return 0; }
 int  USB_MIDI_DEVICE_read_packet(uint8_t *b, size_t l)                   { return 0; }
 void USB_MIDI_DEVICE_push_rx_packet(const uint8_t *p)                   {}
+void USB_MIDI_DEVICE_get_stats(usb_midi_device_stats_t *out)
+{
+    if (out) *out = (usb_midi_device_stats_t){0};
+}
 int  USB_MIDI_DEVICE_set_cdc_rx_callback(usb_midi_device_cdc_rx_cb_t cb,
                                           void *arg)                     { return -1; }
 
