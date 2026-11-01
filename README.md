@@ -88,7 +88,8 @@ conf.gem core: 'picoruby-usb_midi_device'
 
 `picoruby-machine` is pulled in automatically. `picoruby-midi` is not a
 hard dependency — add it only if you want the `MIDI::Device` /
-`MIDI::Input` layer shown above.
+`MIDI::Input` layer shown above. For picoruby-midibase instead, see
+"picoruby-midibase transport" below.
 
 ### 2. Depend on esp_tinyusb 2.x
 
@@ -296,10 +297,70 @@ nothing. With `USB_MIDI_DEVICE_CDC_CONSOLE=1` (the default when CDC is on)
 the port also routes `ESP_LOG`/stdout to the same interface, so the
 callback sees host→device bytes while logs flow the other way.
 
+## picoruby-midibase transport
+
+`mrblib_midibase/usb_midi_device_midibase.rb` makes `USB_MIDI_DEVICE` a
+[picoruby-midibase](https://github.com/picoruby/picoruby/tree/master/mrbgems/picoruby-midibase)
+transport, like `UART::MIDI`: `getevent` / `putevent` / `handle`, so it can
+be a `MIDIBASE::Router` source and sink. It is not in `mrblib/` (a build
+without picoruby-midibase has no `MIDIBASE` to include); a build that has it
+adds the file:
+
+```ruby
+conf.gem core: 'picoruby-usb_midi_device' do |spec|
+  spec.add_dependency 'picoruby-midibase'
+  spec.rbfiles << "#{spec.dir}/mrblib_midibase/usb_midi_device_midibase.rb"
+end
+```
+
+```ruby
+usb = USB_MIDI_DEVICE.instance
+router = MIDIBASE::Router.new
+router.connect(:usb, synth)                        # e.g. PSG::Synth
+Task.new { loop { router.emit(:usb, usb.getevent) } }
+usb.putevent(:note_on, 0, 60, 100)                 # to the host
+```
+
+`getevent` waits with `sleep_ms 1` until a whole message has arrived, so
+other tasks run meanwhile. It and `read_available` take from the same
+buffer: use one or the other. The C side (`_read_byte`, `_write_message`,
+mruby only) turns USB-MIDI packets into the byte stream MIDIBASE parses and
+packs an encoded message back into packets.
+
+## RP2040 / RP2350 (R2P2)
+
+`ports/rp2040/usb_midi_device.c` does not run the USB stack:
+picoruby-machine initialises TinyUSB at boot and is the single caller of
+`tud_task()` (its USB pump); the application's `tusb_config.h` turns
+`CFG_TUD_MIDI` on. Define `USB_MIDI_DEVICE_ENABLED=1` (without it the port
+is the stubs).
+
+The descriptors, as on ESP32, are the gem's by default
+(`ports/rp2040/usb_descriptors.c`: MIDI, optionally with CDC, with the
+identity in `usb_midi_device_config.h`; it defines TinyUSB's
+`tud_descriptor_*_cb()`). An application that has descriptors of its own
+and puts a MIDI interface among them builds with
+`USB_MIDI_DEVICE_OWN_DESCRIPTORS=0`, and the gem's are not built. R2P2 does
+that: its `R2P2_USB_MIDI` option adds the interface to its composite device
+(CDC x3, HID x3) and defines both settings.
+
+Only the USB pump may call TinyUSB, so the port does all of it inside
+`tud_task()`: in `tud_midi_rx_cb()`, and in a function the VM queues there
+with TinyUSB's `usbd_defer_func()`. A ring each way:
+
+    TX: VM -> ring -> (deferred) tud_midi_packet_write()
+    RX: tud_midi_rx_cb() -> tud_midi_packet_read() -> ring -> read_available / getevent
+
+Call it from thread context only (not from an IRQ).
+
+`USB_MIDI_DEVICE_start()` does nothing (TinyUSB is up from boot), and there
+is no CDC hook: a CDC interface, the gem's or the application's, is
+picoruby-machine's console.
+
 ## Notes
 
-- ESP32 only at present (ESP32-P4 / M5Stack Tab5, ESP32-S3 via TinyUSB).
-  Other ports are planned.
+- Ports: ESP32 (ESP32-P4 / M5Stack Tab5, ESP32-S3 via TinyUSB) and
+  RP2040 / RP2350 under R2P2 (above).
 - Singleton: only one USB MIDI device instance exists per build.
 - Hot-plug aware — `connected?` reflects the host enumeration state.
 

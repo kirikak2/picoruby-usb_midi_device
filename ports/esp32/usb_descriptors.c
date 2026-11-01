@@ -18,6 +18,10 @@
 
 #if USB_MIDI_DEVICE_ENABLED
 
+#if !USB_MIDI_DEVICE_OWN_DESCRIPTORS
+#error "the ESP32 port installs esp_tinyusb itself and needs its own descriptors (USB_MIDI_DEVICE_OWN_DESCRIPTORS=1)"
+#endif
+
 #include "tusb.h"
 #include "usb_descriptors.h"
 
