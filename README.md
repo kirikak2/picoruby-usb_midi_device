@@ -296,10 +296,31 @@ nothing. With `USB_MIDI_DEVICE_CDC_CONSOLE=1` (the default when CDC is on)
 the port also routes `ESP_LOG`/stdout to the same interface, so the
 callback sees host→device bytes while logs flow the other way.
 
+## RP2040 / RP2350 (R2P2)
+
+`ports/rp2040/usb_midi_device.c` does not own the USB stack: R2P2 runs
+TinyUSB as one composite device (`picoruby-r2p2`), and a MIDI interface is
+added to it at build time (R2P2's `R2P2_USB_MIDI` option, which also
+defines `USB_MIDI_DEVICE_ENABLED`; without it the port is the stubs). Only
+R2P2's USB pump (the single caller of `tud_task()`) may call TinyUSB, so the
+port does all of it inside `tud_task()`: in `tud_midi_rx_cb()`, and in a
+function the VM queues there with TinyUSB's `usbd_defer_func()`. Nothing
+outside the gem and R2P2's descriptors is changed. A ring each way:
+
+    TX: VM -> ring -> (deferred) tud_midi_packet_write()
+    RX: tud_midi_rx_cb() -> tud_midi_packet_read() -> ring -> read_available
+
+Call it from thread context only (not from an IRQ).
+
+`USB_MIDI_DEVICE_start()` does nothing (TinyUSB is up from boot), the USB
+identity defines in `usb_midi_device_config.h` are not used (the
+descriptors are R2P2's) and there is no CDC hook (the CDC interfaces are
+R2P2's too).
+
 ## Notes
 
-- ESP32 only at present (ESP32-P4 / M5Stack Tab5, ESP32-S3 via TinyUSB).
-  Other ports are planned.
+- Ports: ESP32 (ESP32-P4 / M5Stack Tab5, ESP32-S3 via TinyUSB) and
+  RP2040 / RP2350 under R2P2 (above).
 - Singleton: only one USB MIDI device instance exists per build.
 - Hot-plug aware — `connected?` reflects the host enumeration state.
 
