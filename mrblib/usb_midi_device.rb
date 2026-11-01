@@ -1,7 +1,8 @@
 # USB-MIDI Device transport layer
 #
 # Provides low-level USB MIDI communication when ESP32 acts as a USB MIDI device.
-# Use picoruby-midi for high-level MIDI operations.
+# Use picoruby-midi for high-level MIDI operations, or make this a
+# picoruby-midibase transport (mrblib_midibase/, see the README).
 #
 class USB_MIDI_DEVICE
   def self.instance

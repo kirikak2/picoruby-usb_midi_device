@@ -88,7 +88,8 @@ conf.gem core: 'picoruby-usb_midi_device'
 
 `picoruby-machine` is pulled in automatically. `picoruby-midi` is not a
 hard dependency — add it only if you want the `MIDI::Device` /
-`MIDI::Input` layer shown above.
+`MIDI::Input` layer shown above. For picoruby-midibase instead, see
+"picoruby-midibase transport" below.
 
 ### 2. Depend on esp_tinyusb 2.x
 
@@ -296,6 +297,36 @@ nothing. With `USB_MIDI_DEVICE_CDC_CONSOLE=1` (the default when CDC is on)
 the port also routes `ESP_LOG`/stdout to the same interface, so the
 callback sees host→device bytes while logs flow the other way.
 
+## picoruby-midibase transport
+
+`mrblib_midibase/usb_midi_device_midibase.rb` makes `USB_MIDI_DEVICE` a
+[picoruby-midibase](https://github.com/picoruby/picoruby/tree/master/mrbgems/picoruby-midibase)
+transport, like `UART::MIDI`: `getevent` / `putevent` / `handle`, so it can
+be a `MIDIBASE::Router` source and sink. It is not in `mrblib/` (a build
+without picoruby-midibase has no `MIDIBASE` to include); a build that has it
+adds the file:
+
+```ruby
+conf.gem core: 'picoruby-usb_midi_device' do |spec|
+  spec.add_dependency 'picoruby-midibase'
+  spec.rbfiles << "#{spec.dir}/mrblib_midibase/usb_midi_device_midibase.rb"
+end
+```
+
+```ruby
+usb = USB_MIDI_DEVICE.instance
+router = MIDIBASE::Router.new
+router.connect(:usb, synth)                        # e.g. PSG::Synth
+Task.new { loop { router.emit(:usb, usb.getevent) } }
+usb.putevent(:note_on, 0, 60, 100)                 # to the host
+```
+
+`getevent` waits with `sleep_ms 1` until a whole message has arrived, so
+other tasks run meanwhile. It and `read_available` take from the same
+buffer: use one or the other. The C side (`_read_byte`, `_write_message`,
+mruby only) turns USB-MIDI packets into the byte stream MIDIBASE parses and
+packs an encoded message back into packets.
+
 ## RP2040 / RP2350 (R2P2)
 
 `ports/rp2040/usb_midi_device.c` does not own the USB stack: R2P2 runs
@@ -308,7 +339,7 @@ function the VM queues there with TinyUSB's `usbd_defer_func()`. Nothing
 outside the gem and R2P2's descriptors is changed. A ring each way:
 
     TX: VM -> ring -> (deferred) tud_midi_packet_write()
-    RX: tud_midi_rx_cb() -> tud_midi_packet_read() -> ring -> read_available
+    RX: tud_midi_rx_cb() -> tud_midi_packet_read() -> ring -> read_available / getevent
 
 Call it from thread context only (not from an IRQ).
 

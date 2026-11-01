@@ -64,6 +64,85 @@ mrb_usb_midi_device_read_available(mrb_state *mrb, mrb_value self)
     return mrb_str_new(mrb, (const char *)buffer, read_len);
 }
 
+/*
+ * For the picoruby-midibase transport (mrblib_midibase/): MIDIBASE parses a
+ * byte stream and encodes whole messages, USB-MIDI carries 4-byte packets.
+ */
+
+/* MIDI bytes a packet carries, by Code Index Number (0 / 1: reserved) */
+static const uint8_t k_cin_length[16] = {
+    0, 0, 2, 3, 3, 1, 2, 3, 3, 3, 3, 3, 2, 2, 3, 1
+};
+
+/* What is left of the packet _read_byte is handing out */
+static uint8_t s_rx_bytes[3];
+static uint8_t s_rx_len, s_rx_pos;
+
+/* USB_MIDI_DEVICE#_read_byte -> the next MIDI byte from the host, or nil */
+static mrb_value
+mrb_usb_midi_device_read_byte(mrb_state *mrb, mrb_value self)
+{
+    while (s_rx_pos >= s_rx_len) {
+        uint8_t packet[4];
+        if (USB_MIDI_DEVICE_read_packet(packet, 4) < 4) {
+            return mrb_nil_value();
+        }
+        s_rx_len = k_cin_length[packet[0] & 0x0F];
+        s_rx_pos = 0;
+        s_rx_bytes[0] = packet[1];
+        s_rx_bytes[1] = packet[2];
+        s_rx_bytes[2] = packet[3];
+    }
+    return mrb_fixnum_value(s_rx_bytes[s_rx_pos++]);
+}
+
+static int
+send3(uint8_t cin, const uint8_t *b, int n)
+{
+    return USB_MIDI_DEVICE_send_packet(0, cin, b[0], n > 1 ? b[1] : 0, n > 2 ? b[2] : 0);
+}
+
+/* USB_MIDI_DEVICE#_write_message(bytes) -> bytes sent, or -1
+ * `bytes` is one whole message as MIDIBASE.encode makes it. */
+static mrb_value
+mrb_usb_midi_device_write_message(mrb_state *mrb, mrb_value self)
+{
+    mrb_value str;
+    mrb_get_args(mrb, "S", &str);
+    const uint8_t *b = (const uint8_t *)RSTRING_PTR(str);
+    int n = (int)RSTRING_LEN(str);
+    if (n == 0) return mrb_fixnum_value(0);
+
+    uint8_t status = b[0];
+    int ret = 0;
+    if (status == 0xF0) {
+        /* SysEx: three bytes a packet, the last one says how many end it */
+        int i = 0;
+        while (ret == 0 && i < n) {
+            int left = n - i;
+            if (left > 3) {
+                ret = send3(0x4, b + i, 3);
+                i += 3;
+            } else {
+                ret = send3((uint8_t)(0x4 + left), b + i, left);   /* 5 / 6 / 7 */
+                i = n;
+            }
+        }
+    } else if (0x80 <= status && status < 0xF0) {
+        ret = send3(status >> 4, b, n);
+    } else {
+        switch (status) {
+        case 0xF1: case 0xF3: ret = send3(0x2, b, n); break;   /* 2-byte System Common */
+        case 0xF2:            ret = send3(0x3, b, n); break;   /* Song Position */
+        case 0xF6:            ret = send3(0x5, b, n); break;   /* Tune Request */
+        default:   /* realtime, or anything else: a byte a packet */
+            for (int i = 0; ret == 0 && i < n; i++) ret = send3(0xF, b + i, 1);
+            break;
+        }
+    }
+    return mrb_fixnum_value(ret == 0 ? n : -1);
+}
+
 void
 mrb_picoruby_usb_midi_device_gem_init(mrb_state *mrb)
 {
@@ -74,6 +153,8 @@ mrb_picoruby_usb_midi_device_gem_init(mrb_state *mrb)
     mrb_define_method_id(mrb, cls, MRB_SYM(_send_packet),     mrb_usb_midi_device_send_packet,     MRB_ARGS_REQ(5));
     mrb_define_method_id(mrb, cls, MRB_SYM(_bytes_available), mrb_usb_midi_device_bytes_available, MRB_ARGS_NONE());
     mrb_define_method_id(mrb, cls, MRB_SYM(_read_available),  mrb_usb_midi_device_read_available,  MRB_ARGS_NONE());
+    mrb_define_method_id(mrb, cls, MRB_SYM(_read_byte),       mrb_usb_midi_device_read_byte,       MRB_ARGS_NONE());
+    mrb_define_method_id(mrb, cls, MRB_SYM(_write_message),   mrb_usb_midi_device_write_message,   MRB_ARGS_REQ(1));
 }
 
 void
