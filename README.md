@@ -329,24 +329,33 @@ packs an encoded message back into packets.
 
 ## RP2040 / RP2350 (R2P2)
 
-`ports/rp2040/usb_midi_device.c` does not own the USB stack: R2P2 runs
-TinyUSB as one composite device (`picoruby-r2p2`), and a MIDI interface is
-added to it at build time (R2P2's `R2P2_USB_MIDI` option, which also
-defines `USB_MIDI_DEVICE_ENABLED`; without it the port is the stubs). Only
-R2P2's USB pump (the single caller of `tud_task()`) may call TinyUSB, so the
-port does all of it inside `tud_task()`: in `tud_midi_rx_cb()`, and in a
-function the VM queues there with TinyUSB's `usbd_defer_func()`. Nothing
-outside the gem and R2P2's descriptors is changed. A ring each way:
+`ports/rp2040/usb_midi_device.c` does not run the USB stack:
+picoruby-machine initialises TinyUSB at boot and is the single caller of
+`tud_task()` (its USB pump); the application's `tusb_config.h` turns
+`CFG_TUD_MIDI` on. Define `USB_MIDI_DEVICE_ENABLED=1` (without it the port
+is the stubs).
+
+The descriptors, as on ESP32, are the gem's by default
+(`ports/rp2040/usb_descriptors.c`: MIDI, optionally with CDC, with the
+identity in `usb_midi_device_config.h`; it defines TinyUSB's
+`tud_descriptor_*_cb()`). An application that has descriptors of its own
+and puts a MIDI interface among them builds with
+`USB_MIDI_DEVICE_OWN_DESCRIPTORS=0`, and the gem's are not built. R2P2 does
+that: its `R2P2_USB_MIDI` option adds the interface to its composite device
+(CDC x3, HID x3) and defines both settings.
+
+Only the USB pump may call TinyUSB, so the port does all of it inside
+`tud_task()`: in `tud_midi_rx_cb()`, and in a function the VM queues there
+with TinyUSB's `usbd_defer_func()`. A ring each way:
 
     TX: VM -> ring -> (deferred) tud_midi_packet_write()
     RX: tud_midi_rx_cb() -> tud_midi_packet_read() -> ring -> read_available / getevent
 
 Call it from thread context only (not from an IRQ).
 
-`USB_MIDI_DEVICE_start()` does nothing (TinyUSB is up from boot), the USB
-identity defines in `usb_midi_device_config.h` are not used (the
-descriptors are R2P2's) and there is no CDC hook (the CDC interfaces are
-R2P2's too).
+`USB_MIDI_DEVICE_start()` does nothing (TinyUSB is up from boot), and there
+is no CDC hook: a CDC interface, the gem's or the application's, is
+picoruby-machine's console.
 
 ## Notes
 

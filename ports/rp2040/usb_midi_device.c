@@ -1,13 +1,22 @@
 /*
  * PicoRuby USB-MIDI Device - RP2040 / RP2350 port (R2P2)
  *
- * Unlike the ESP32 port, this gem does not own the USB stack here. R2P2
- * runs TinyUSB as one composite device (picoruby-r2p2: CDC x3, HID x3) and
- * a build with R2P2_USB_MIDI=1 adds a MIDI interface to it. TinyUSB has no
- * locking (OPT_OS_NONE): only R2P2's USB pump (picoruby-machine, the
- * single caller of tud_task()) may call into it. So every TinyUSB call of
- * this port runs inside tud_task(): in tud_midi_rx_cb(), or in a function
- * the VM queues there with TinyUSB's own usbd_defer_func():
+ * Unlike the ESP32 port, this gem does not run the USB stack here:
+ * picoruby-machine initialises TinyUSB at boot and is the single caller of
+ * tud_task() (its USB pump). The application's tusb_config.h must turn
+ * CFG_TUD_MIDI on. The descriptors are either
+ *
+ *   - this gem's (usb_descriptors.c, USB_MIDI_DEVICE_OWN_DESCRIPTORS=1, the
+ *     default): the device is the MIDI interface (plus CDC if configured),
+ *     with the identity in usb_midi_device_config.h; or
+ *   - the application's (USB_MIDI_DEVICE_OWN_DESCRIPTORS=0): it puts a MIDI
+ *     interface among its own, as R2P2 does in its composite device (CDC x3,
+ *     HID x3) when built with R2P2_USB_MIDI=1.
+ *
+ * Either way this file is the same. TinyUSB has no locking (OPT_OS_NONE),
+ * so every TinyUSB call of this port runs inside tud_task(): in
+ * tud_midi_rx_cb(), or in a function the VM queues there with TinyUSB's own
+ * usbd_defer_func():
  *
  *   TX: VM -> tx ring -> (deferred) tud_midi_packet_write()
  *   RX: tud_midi_rx_cb() -> tud_midi_packet_read() -> rx ring -> VM
@@ -23,9 +32,8 @@
  * NAKs the host (backpressure rather than loss), and is fetched once the
  * VM has read some.
  *
- * The USB identity in usb_midi_device_config.h (VID / PID, strings) is not
- * used: the descriptors are R2P2's. USB_MIDI_DEVICE_ENABLED is set by
- * R2P2's cmake with R2P2_USB_MIDI; without it this file is the stubs.
+ * Without USB_MIDI_DEVICE_ENABLED (R2P2's cmake sets it with R2P2_USB_MIDI)
+ * this file is the stubs.
  */
 
 #include "../../include/usb_midi_device_config.h"

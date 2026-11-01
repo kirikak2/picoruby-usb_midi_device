@@ -47,6 +47,23 @@
 #endif
 
 /*
+ * Whose USB descriptors the device enumerates with.
+ *
+ * 1 (default): this gem's, from ports/<port>/usb_descriptors.c -- a device
+ * whose USB is the MIDI interface (plus the optional CDC one below), with
+ * the identity configured in this file.
+ *
+ * 0: the host application's. It has descriptors of its own and puts a MIDI
+ * interface among them (R2P2's composite device, for one); the gem's are
+ * not built, and the USB identity and endpoint settings below go unused.
+ *
+ * The ESP32 port installs esp_tinyusb itself and always uses its own.
+ */
+#ifndef USB_MIDI_DEVICE_OWN_DESCRIPTORS
+#  define USB_MIDI_DEVICE_OWN_DESCRIPTORS 1
+#endif
+
+/*
  * Add a CDC-ACM interface next to the MIDI interface (composite device).
  * Off by default: a USB-MIDI device gem describes a MIDI device, and the
  * extra interface changes the descriptor layout, the device class (IAD)
